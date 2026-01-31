@@ -618,6 +618,211 @@ async function sendTextMessage(
   })).data;
 }
 
+// 主动发送消息到指定用户（用于 outbound）
+async function sendProactiveMessage(
+  config: any,
+  userId: string,
+  text: string,
+  log?: any,
+): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  try {
+    const token = await getAccessToken(config);
+
+    // 使用钉钉机器人批量发送消息 API
+    const body = {
+      robotCode: config.clientId,
+      userIds: [userId],
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content: text }),
+    };
+
+    log?.info?.(`[DingTalk][Outbound] 发送消息到 ${userId}: "${text.slice(0, 50)}..."`);
+
+    const response = await axios.post(
+      'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend',
+      body,
+      {
+        headers: {
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    log?.info?.(`[DingTalk][Outbound] 发送成功: ${JSON.stringify(response.data)}`);
+
+    return {
+      ok: true,
+      messageId: response.data?.processQueryKey || 'unknown',
+    };
+  } catch (err: any) {
+    log?.error?.(`[DingTalk][Outbound] 发送失败: ${err.message}`);
+    if (err.response) {
+      log?.error?.(`[DingTalk][Outbound] 错误响应: ${JSON.stringify(err.response.data)}`);
+    }
+    return {
+      ok: false,
+      error: err.message,
+    };
+  }
+}
+
+// 发送群消息（文本模式，降级方案）
+async function sendGroupMessage(
+  config: any,
+  conversationId: string,
+  text: string,
+  log?: any,
+): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  try {
+    const token = await getAccessToken(config);
+
+    const body = {
+      robotCode: config.clientId,
+      openConversationId: conversationId,
+      msgKey: 'sampleText',
+      msgParam: JSON.stringify({ content: text }),
+    };
+
+    log?.info?.(`[DingTalk][Outbound][Group] 发送文本消息到群 ${conversationId}`);
+
+    const response = await axios.post(
+      'https://api.dingtalk.com/v1.0/robot/groupMessages/send',
+      body,
+      {
+        headers: {
+          'x-acs-dingtalk-access-token': token,
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    log?.info?.(`[DingTalk][Outbound][Group] 发送成功: ${JSON.stringify(response.data)}`);
+
+    return {
+      ok: true,
+      messageId: response.data?.processQueryKey || 'unknown',
+    };
+  } catch (err: any) {
+    log?.error?.(`[DingTalk][Outbound][Group] 发送失败: ${err.message}`);
+    if (err.response) {
+      log?.error?.(`[DingTalk][Outbound][Group] 错误响应: ${JSON.stringify(err.response.data)}`);
+    }
+    return {
+      ok: false,
+      error: err.message,
+    };
+  }
+}
+
+// 创建主动投放的 AI Card
+async function createProactiveAICard(
+  config: any,
+  target: string,
+  isGroup: boolean,
+  log?: any,
+): Promise<AICardInstance | null> {
+  try {
+    const token = await getAccessToken(config);
+    const cardInstanceId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    log?.info?.(`[DingTalk][AICard][Proactive] 创建卡片 outTrackId=${cardInstanceId}, target=${target}, isGroup=${isGroup}`);
+
+    // 1. 创建卡片实例
+    const createBody = {
+      cardTemplateId: AI_CARD_TEMPLATE_ID,
+      outTrackId: cardInstanceId,
+      cardData: {
+        cardParamMap: {},
+      },
+      callbackType: 'STREAM',
+      imGroupOpenSpaceModel: { supportForward: true },
+      imRobotOpenSpaceModel: { supportForward: true },
+    };
+
+    log?.info?.(`[DingTalk][AICard][Proactive] POST /v1.0/card/instances`);
+    const createResp = await axios.post(`${DINGTALK_API}/v1.0/card/instances`, createBody, {
+      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
+    });
+    log?.info?.(`[DingTalk][AICard][Proactive] 创建响应: ${JSON.stringify(createResp.data)}`);
+
+    // 2. 投放卡片（根据目标类型构造不同的 deliverBody）
+    const deliverBody: any = {
+      outTrackId: cardInstanceId,
+      userIdType: 1,
+    };
+
+    if (isGroup) {
+      deliverBody.openSpaceId = `dtv1.card//IM_GROUP.${target}`;
+      deliverBody.imGroupOpenDeliverModel = {
+        robotCode: config.clientId,
+      };
+    } else {
+      deliverBody.openSpaceId = `dtv1.card//IM_ROBOT.${target}`;
+      deliverBody.imRobotOpenDeliverModel = { spaceType: 'IM_ROBOT' };
+    }
+
+    log?.info?.(`[DingTalk][AICard][Proactive] POST /v1.0/card/instances/deliver`);
+    const deliverResp = await axios.post(`${DINGTALK_API}/v1.0/card/instances/deliver`, deliverBody, {
+      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
+    });
+    log?.info?.(`[DingTalk][AICard][Proactive] 投放响应: ${JSON.stringify(deliverResp.data)}`);
+
+    return { cardInstanceId, accessToken: token, inputingStarted: false };
+  } catch (err: any) {
+    log?.error?.(`[DingTalk][AICard][Proactive] 创建失败: ${err.message}`);
+    if (err.response) {
+      log?.error?.(`[DingTalk][AICard][Proactive] 错误响应: ${JSON.stringify(err.response.data)}`);
+    }
+    return null;
+  }
+}
+
+// 发送主动 AI Card 消息（支持流式）
+async function sendProactiveAICardMessage(
+  config: any,
+  target: string,
+  isGroup: boolean,
+  text: string,
+  log?: any,
+): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  try {
+    // 1. 创建 AI Card
+    const card = await createProactiveAICard(config, target, isGroup, log);
+    if (!card) {
+      return { ok: false, error: 'Failed to create AI Card' };
+    }
+
+    log?.info?.(`[DingTalk][AICard][Proactive] 开始流式输出，内容长度=${text.length}`);
+
+    // 2. 流式输出内容（模拟打字机效果）
+    const chunkSize = 50; // 每次输出 50 个字符
+    let accumulated = '';
+
+    for (let i = 0; i < text.length; i += chunkSize) {
+      accumulated = text.slice(0, i + chunkSize);
+      await streamAICard(card, accumulated, false, log);
+      await new Promise(resolve => setTimeout(resolve, 300)); // 300ms 间隔
+    }
+
+    // 3. 完成输出
+    await finishAICard(card, text, log);
+
+    log?.info?.(`[DingTalk][AICard][Proactive] 发送完成，cardInstanceId=${card.cardInstanceId}`);
+
+    return {
+      ok: true,
+      messageId: card.cardInstanceId,
+    };
+  } catch (err: any) {
+    log?.error?.(`[DingTalk][AICard][Proactive] 发送失败: ${err.message}`);
+    return {
+      ok: false,
+      error: err.message,
+    };
+  }
+}
+
 // 智能选择 text / markdown
 async function sendMessage(
   config: any,
@@ -824,7 +1029,31 @@ const dingtalkPlugin = {
         systemPrompt: { type: 'string', default: '', description: 'Custom system prompt' },
         dmPolicy: { type: 'string', enum: ['open', 'pairing', 'allowlist'], default: 'open' },
         allowFrom: { type: 'array', items: { type: 'string' }, description: 'Allowed sender IDs' },
+        dms: {
+          type: 'object',
+          additionalProperties: {
+            type: 'object',
+            properties: {
+              enabled: { type: 'boolean', default: true },
+              systemPrompt: { type: 'string' },
+            }
+          },
+          description: 'Per-user DM configurations'
+        },
         groupPolicy: { type: 'string', enum: ['open', 'allowlist'], default: 'open' },
+        groupAllowFrom: { type: 'array', items: { type: 'string' }, description: 'Allowed group conversationIds' },
+        groups: {
+          type: 'object',
+          additionalProperties: {
+            type: 'object',
+            properties: {
+              enabled: { type: 'boolean', default: true },
+              requireMention: { type: 'boolean', default: true },
+              systemPrompt: { type: 'string' },
+            }
+          },
+          description: 'Group configurations by conversationId'
+        },
         gatewayToken: { type: 'string', default: '', description: 'Gateway auth token (Bearer)' },
         gatewayPassword: { type: 'string', default: '', description: 'Gateway auth password (alternative to token)' },
         sessionTimeout: { type: 'number', default: 1800000, description: 'Session timeout in ms (default 30min)' },
@@ -878,19 +1107,130 @@ const dingtalkPlugin = {
     resolveRequireMention: ({ cfg }: any) => getConfig(cfg).groupPolicy !== 'open',
   },
   messaging: {
-    normalizeTarget: ({ target }: any) =>
-      target ? { targetId: target.replace(/^(dingtalk-connector|dingtalk|dd|ding):/i, '') } : null,
+    normalizeTarget: ({ target }: any) => {
+      if (!target) return null;
+
+      // 去掉前缀
+      let id = target.replace(/^(dingtalk-connector|dingtalk|dd|ding):/i, '');
+
+      // 支持显式指定类型：user:xxx 或 group:xxx
+      let kind: 'user' | 'group';
+      if (id.startsWith('user:')) {
+        kind = 'user';
+        id = id.slice(5); // 去掉 "user:"
+      } else if (id.startsWith('group:')) {
+        kind = 'group';
+        id = id.slice(6); // 去掉 "group:"
+      } else {
+        // 自动检测：群ID格式为 cidxxxx==（base64编码）
+        kind = /^cid[A-Za-z0-9+/]+=*$/.test(id) ? 'group' : 'user';
+      }
+
+      return {
+        targetId: id,
+        kind,
+      };
+    },
     targetResolver: {
-      looksLikeId: (id: string) => /^[\w-]+$/.test(id),
-      hint: '<conversationId>',
+      looksLikeId: (id: string) => {
+        // 群ID：cidxxxx== 格式
+        if (/^cid[A-Za-z0-9+/]+=*$/.test(id)) return true;
+        // 用户ID：字母数字组合
+        if (/^[\w-]+$/.test(id)) return true;
+        return false;
+      },
+      hint: '<user:userId | group:conversationId | userId | conversationId>',
+    },
+  },
+  directory: {
+    listPeers: async ({ account }: any) => {
+      const allowFrom = account.config?.allowFrom || [];
+      const dms = account.config?.dms || {};
+
+      const peers: Array<{ kind: 'user'; id: string }> = [];
+
+      // 从 allowFrom 添加
+      for (const id of allowFrom) {
+        peers.push({ kind: 'user', id });
+      }
+
+      // 从 dms 添加
+      for (const id of Object.keys(dms)) {
+        if (!peers.some(p => p.id === id)) {
+          peers.push({ kind: 'user', id });
+        }
+      }
+
+      return peers;
+    },
+
+    listGroups: async ({ account }: any) => {
+      const groupAllowFrom = account.config?.groupAllowFrom || [];
+      const groups = account.config?.groups || {};
+
+      const result: Array<{ kind: 'group'; id: string }> = [];
+
+      // 从 groupAllowFrom 添加
+      for (const id of groupAllowFrom) {
+        result.push({ kind: 'group', id });
+      }
+
+      // 从 groups 添加
+      for (const id of Object.keys(groups)) {
+        if (!result.some(g => g.id === id)) {
+          result.push({ kind: 'group', id });
+        }
+      }
+
+      return result;
     },
   },
   outbound: {
     deliveryMode: 'direct' as const,
-    sendText: async () => ({
-      ok: false as const,
-      error: 'DingTalk requires sessionWebhook context',
-    }),
+    sendText: async ({ to, text, accountId, cfg }: any) => {
+      const rt = getRuntime();
+      const account = dingtalkPlugin.config.resolveAccount(cfg, accountId);
+      const config = account.config;
+
+      if (!config.clientId || !config.clientSecret) {
+        return { ok: false as const, error: 'DingTalk not configured' };
+      }
+
+      // 解析目标类型
+      const normalized = dingtalkPlugin.messaging.normalizeTarget({ target: to });
+      if (!normalized) {
+        return { ok: false as const, error: 'Invalid target' };
+      }
+
+      const { targetId, kind } = normalized;
+      const isGroup = kind === 'group';
+
+      rt.logger?.info?.(`[DingTalk][Outbound] 发送消息到 ${isGroup ? '群' : '个人'}: ${targetId}`);
+
+      // 策略：优先使用 AI Card（流式体验更好），失败时降级到文本消息
+      let result = await sendProactiveAICardMessage(config, targetId, isGroup, text, rt.logger);
+
+      if (!result.ok) {
+        rt.logger?.warn?.(`[DingTalk][Outbound] AI Card 发送失败，降级到文本消息`);
+
+        // 降级到文本消息
+        if (isGroup) {
+          result = await sendGroupMessage(config, targetId, text, rt.logger);
+        } else {
+          result = await sendProactiveMessage(config, targetId, text, rt.logger);
+        }
+      }
+
+      if (result.ok) {
+        return {
+          ok: true as const,
+          channel: 'dingtalk-connector' as const,
+          messageId: result.messageId || 'unknown',
+        };
+      }
+
+      return { ok: false as const, error: result.error || 'Unknown error' };
+    },
   },
   gateway: {
     startAccount: async (ctx: any) => {
